@@ -13,6 +13,7 @@ pub enum Cmd {
     Clear,
     Style(String),
     Sound(Option<bool>),
+    Through(Option<bool>),
     Quit,
 }
 
@@ -37,11 +38,15 @@ pub fn parse(words: &[String]) -> Result<Cmd, String> {
         ("sound", Some("off")) => Ok(Cmd::Sound(Some(false))),
         ("sound", Some("toggle") | None) => Ok(Cmd::Sound(None)),
         ("sound", Some(v)) => Err(format!("unknown sound value: {v}")),
+        ("clickthrough", Some("on")) => Ok(Cmd::Through(Some(true))),
+        ("clickthrough", Some("off")) => Ok(Cmd::Through(Some(false))),
+        ("clickthrough", Some("toggle") | None) => Ok(Cmd::Through(None)),
+        ("clickthrough", Some(v)) => Err(format!("unknown clickthrough value: {v}")),
         _ => Err(format!("unknown command: {text}")),
     }
 }
 
-fn home() -> PathBuf {
+pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
 
@@ -60,8 +65,12 @@ pub fn state_path() -> PathBuf {
     xdg("XDG_DATA_HOME", ".local/share").join("tinyhand/state.json")
 }
 
+pub fn config_dir() -> PathBuf {
+    xdg("XDG_CONFIG_HOME", ".config").join("tinyhand")
+}
+
 fn config_path() -> PathBuf {
-    xdg("XDG_CONFIG_HOME", ".config").join("tinyhand/config.json")
+    config_dir().join("config.json")
 }
 
 /// Sends a command line to a running instance. Err means nothing is listening.
@@ -103,6 +112,8 @@ pub struct Settings {
     pub size: f32,
     pub shadow: bool,
     pub fade_seconds: f32,
+    /// In click-through, hide the ordinary arrow cursor so the hand is the pointer.
+    pub hide_arrow: bool,
 }
 
 impl Settings {
@@ -117,6 +128,7 @@ impl Settings {
             size: (v["pointerSize"].as_f64().unwrap_or(0.13) as f32).clamp(0.08, 0.20),
             shadow: v["showShadow"].as_bool().unwrap_or(true),
             fade_seconds: v["fadeSeconds"].as_f64().unwrap_or(3.0) as f32,
+            hide_arrow: v["hideArrow"].as_bool().unwrap_or(true),
         }
     }
 
@@ -127,6 +139,7 @@ impl Settings {
             "pointerSize": self.size,
             "showShadow": self.shadow,
             "fadeSeconds": self.fade_seconds,
+            "hideArrow": self.hide_arrow,
         });
         write(config_path(), &v);
     }
@@ -143,7 +156,7 @@ fn write(path: PathBuf, v: &serde_json::Value) {
 }
 
 /// Same shape as upstream's state.json, for launchers and scripts.
-pub fn write_state(active: bool, style: &str, sound_on: bool) {
+pub fn write_state(active: bool, style: &str, sound_on: bool, click_through: bool) {
     let mut styles: Vec<serde_json::Value> =
         STYLES.iter().map(|(id, name, _)| serde_json::json!({"id": id, "name": name, "type": "hand"})).collect();
     styles.push(serde_json::json!({"id": LASER, "name": "Laser dot", "type": "laser"}));
@@ -152,6 +165,7 @@ pub fn write_state(active: bool, style: &str, sound_on: bool) {
         "active": active,
         "style": style,
         "soundOn": sound_on,
+        "clickThrough": click_through,
         "styles": styles,
     });
     write(state_path(), &v);

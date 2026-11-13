@@ -3,6 +3,8 @@
 //! A Wayland layer-shell overlay covers each output while the pointer is on. It swallows
 //! clicks (they become taps), draws ink while dragging, and shows a small toolbar.
 
+mod arrow;
+mod cursor;
 mod ipc;
 mod render;
 mod tray;
@@ -10,7 +12,7 @@ mod tray;
 use ipc::{Cmd, Settings};
 use render::{Action, Layout, Library, Stroke, ToolbarState, LASER};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
@@ -60,6 +62,8 @@ struct View {
     popup: bool,
     hover: Option<usize>,
     over_ui: bool,
+    /// Click-through: the pointer belongs to the apps underneath, except over the toolbar.
+    through: bool,
     last: Instant,
     animating: bool,
 }
@@ -80,6 +84,7 @@ impl View {
             popup: false,
             hover: None,
             over_ui: false,
+            through: false,
             last: Instant::now(),
             animating: false,
         }
@@ -125,7 +130,7 @@ impl View {
         }
 
         let layout = Layout::new(self.w, self.h, self.k, pinned, self.popup);
-        let st = ToolbarState { style: &set.style, sound_on: set.sound_on, popup: self.popup, hover: self.hover };
+        let st = ToolbarState { style: &set.style, sound_on: set.sound_on, through: self.through, popup: self.popup, hover: self.hover };
         render::draw_toolbar(pm, lib, &layout, &st, self.k);
 
         if let Some(c) = self.cursor {
@@ -158,6 +163,8 @@ struct Overlay {
     configured: bool,
     frame_pending: bool,
     dirty: bool,
+    /// The (click-through, popup) pair the surface's input region was last set for.
+    region_for: Option<(bool, bool)>,
     view: View,
 }
 
@@ -179,6 +186,11 @@ struct App {
     settings: Settings,
     pinned: Vec<String>,
     tray: Option<tray::Handle>,
+    through: bool,
+    tracker: Option<cursor::Tracker>,
+    arrow: arrow::ArrowHider,
+    shift_down: Option<Instant>,
+    last_shift_tap: Option<Instant>,
     exit: bool,
 }
 
@@ -215,6 +227,7 @@ impl App {
                 configured: false,
                 frame_pending: false,
                 dirty: false,
+                region_for: None,
                 view: View::new(),
             });
         }
@@ -224,14 +237,69 @@ impl App {
         self.overlays.clear();
     }
 
+    fn tracking(&self) -> bool {
+        self.tracker.as_ref().is_some_and(|t| t.loaded())
+    }
+
+    /// Brings the overlays and the cursor feed in line with `through` and whether we're on.
+    fn apply_mode(&mut self) {
+        let through = self.through;
+        let want = through && self.active();
+        if let Some(t) = &mut self.tracker {
+            if want {
+                if let Err(e) = t.start() {
+                    eprintln!("tinyhand: can't follow the cursor in click-through ({e}); the hand is hidden instead");
+                }
+            } else {
+                t.stop();
+            }
+        }
+        let tracking = self.tracking();
+        // Only hide the arrow when the hand is really there to stand in for it.
+        self.arrow.set(want && tracking && self.settings.hide_arrow);
+        for ov in &mut self.overlays {
+            // Tapping needs the keyboard for Esc; in click-through, typing belongs to the apps.
+            ov.layer.set_keyboard_interactivity(if through {
+                KeyboardInteractivity::OnDemand
+            } else {
+                KeyboardInteractivity::Exclusive
+            });
+            if through != ov.view.through {
+                ov.view.through = through;
+                ov.view.release();
+                if through && !tracking {
+                    ov.view.cursor = None;
+                }
+            }
+        }
+    }
+
+    /// A cursor position from the KWin script, in global compositor coordinates.
+    fn cursor_moved(&mut self, x: f32, y: f32) {
+        if !self.through {
+            return;
+        }
+        for i in 0..self.overlays.len() {
+            let ov = &mut self.overlays[i];
+            let info = self.output_state.info(&ov.output);
+            let (ox, oy) = info.as_ref().and_then(|i| i.logical_position).unwrap_or((0, 0));
+            let (lx, ly) = (x - ox as f32, y - oy as f32);
+            let inside = lx >= 0.0 && ly >= 0.0 && lx < ov.size.0 as f32 && ly < ov.size.1 as f32;
+            let k = ov.scale as f32;
+            ov.view.cursor = inside.then_some((lx * k, ly * k));
+            self.redraw(i);
+        }
+    }
+
     /// Publishes the current state to the tray and state.json, and repaints.
     fn sync(&mut self) {
-        let (active, sound_on) = (self.active(), self.settings.sound_on);
-        ipc::write_state(active, &self.settings.style, sound_on);
+        let (active, sound_on, through) = (self.active(), self.settings.sound_on, self.through);
+        ipc::write_state(active, &self.settings.style, sound_on, through);
         if let Some(t) = &self.tray {
             t.update(|t| {
                 t.active = active;
                 t.sound_on = sound_on;
+                t.through = through;
             });
         }
         for i in 0..self.overlays.len() {
@@ -273,8 +341,10 @@ impl App {
                 self.settings.sound_on = v.unwrap_or(!self.settings.sound_on);
                 self.settings.save();
             }
+            Cmd::Through(v) => self.through = v.unwrap_or(!self.through),
             Cmd::Quit => self.exit = true,
         }
+        self.apply_mode();
         self.sync();
     }
 
@@ -297,8 +367,10 @@ impl App {
                 self.settings.sound_on = !self.settings.sound_on;
                 self.settings.save();
             }
+            Action::Through => self.through = !self.through,
             Action::Exit => self.deactivate(),
         }
+        self.apply_mode();
         self.sync();
     }
 
@@ -331,7 +403,7 @@ impl App {
     }
 
     fn draw(&mut self, i: usize) {
-        let App { overlays, pool, lib, settings, pinned, qh, .. } = self;
+        let App { overlays, pool, lib, settings, pinned, qh, compositor, .. } = self;
         let Some(ov) = overlays.get_mut(i) else { return };
         let (pw, ph) = (ov.size.0 as i32 * ov.scale, ov.size.1 as i32 * ov.scale);
         if pw <= 0 || ph <= 0 {
@@ -349,6 +421,24 @@ impl App {
         ov.view.paint(&mut pm, lib, settings, pinned);
 
         let surface = ov.layer.wl_surface();
+        let mode = (ov.view.through, ov.view.popup);
+        if ov.region_for != Some(mode) {
+            ov.region_for = Some(mode);
+            match (mode.0, Region::new(compositor)) {
+                (true, Ok(region)) => {
+                    // Only the toolbar takes the pointer; everything else falls through.
+                    let k = ov.view.k;
+                    let layout = Layout::new(ov.view.w, ov.view.h, k, pinned, ov.view.popup);
+                    for r in [Some(layout.bar), layout.grid].into_iter().flatten() {
+                        let (x, y) = ((r.x / k).floor(), (r.y / k).floor());
+                        let (w, h) = (((r.x + r.w) / k).ceil() - x, ((r.y + r.h) / k).ceil() - y);
+                        region.add(x as i32, y as i32, w as i32, h as i32);
+                    }
+                    surface.set_input_region(Some(region.wl_region()));
+                }
+                _ => surface.set_input_region(None),
+            }
+        }
         surface.set_buffer_scale(ov.scale);
         surface.damage_buffer(0, 0, pw, ph);
         surface.frame(qh, surface.clone());
@@ -410,6 +500,7 @@ impl LayerShellHandler for App {
         let Some(i) = self.overlays.iter().position(|o| &o.layer == layer) else { return };
         let ov = &mut self.overlays[i];
         ov.size = configure.new_size;
+        ov.region_for = None;
         ov.configured = true;
         ov.frame_pending = false;
         self.draw(i);
@@ -457,6 +548,9 @@ impl KeyboardHandler for App {
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
 
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+        if !matches!(event.keysym, Keysym::Shift_L | Keysym::Shift_R) {
+            (self.shift_down, self.last_shift_tap) = (None, None);
+        }
         let chord = self.mods.ctrl && self.mods.alt;
         if event.keysym == Keysym::Escape || (chord && event.keysym == Keysym::h) {
             self.command(Cmd::Off);
@@ -469,6 +563,23 @@ impl KeyboardHandler for App {
 
     fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _serial: u32, modifiers: Modifiers, _layout: u32) {
         self.mods = modifiers;
+        // Double-tap Shift flips click-through, like upstream.
+        let m = modifiers;
+        let now = Instant::now();
+        if m.shift && !(m.ctrl || m.alt || m.logo) {
+            self.shift_down.get_or_insert(now);
+        } else if m.ctrl || m.alt || m.logo {
+            (self.shift_down, self.last_shift_tap) = (None, None);
+        } else if let Some(down) = self.shift_down.take() {
+            if now.duration_since(down).as_secs_f32() >= 0.3 {
+                self.last_shift_tap = None;
+            } else if self.last_shift_tap.take().is_some_and(|t| down.duration_since(t).as_secs_f32() < 0.35) {
+                self.command(Cmd::Through(None));
+                return;
+            } else {
+                self.last_shift_tap = Some(now);
+            }
+        }
         // Holding Ctrl (or Super) while drawing puts an arrowhead on the line.
         let arrow = modifiers.ctrl || modifiers.logo;
         for i in 0..self.overlays.len() {
@@ -489,7 +600,8 @@ impl PointerHandler for App {
         let mut tapped = false;
         for event in events {
             let Some(i) = self.overlay_of(&event.surface) else { continue };
-            let App { overlays, pinned, settings, pointer, mods, .. } = self;
+            let follows = self.through && self.tracking();
+            let App { overlays, pinned, settings, pointer, mods, through, .. } = self;
             let ov = &mut overlays[i];
             let v = &mut ov.view;
             let p = (event.position.0 as f32 * v.k, event.position.1 as f32 * v.k);
@@ -505,7 +617,10 @@ impl PointerHandler for App {
                     if over != v.over_ui || entered {
                         v.over_ui = over;
                         if let Some(ptr) = pointer {
-                            let _ = if over { ptr.set_cursor(conn, CursorIcon::Default) } else { ptr.hide_cursor() };
+                            // In click-through the arrow may be hidden system-wide, so the toolbar
+                            // gets the link hand, which is always visible.
+                            let icon = if *through { CursorIcon::Pointer } else { CursorIcon::Default };
+                            let _ = if over { ptr.set_cursor(conn, icon) } else { ptr.hide_cursor() };
                         }
                     }
                     if let (true, Some(start)) = (v.held, v.down_at) {
@@ -531,7 +646,11 @@ impl PointerHandler for App {
                     }
                 }
                 PointerEventKind::Leave { .. } => {
-                    v.cursor = None;
+                    // In click-through the pointer has only left the toolbar; KWin keeps
+                    // telling us where it is.
+                    if !follows {
+                        v.cursor = None;
+                    }
                     v.hover = None;
                     v.over_ui = false;
                     v.release();
@@ -539,7 +658,7 @@ impl PointerHandler for App {
                 PointerEventKind::Press { button: BTN_LEFT, .. } => {
                     if layout.over_ui(p) {
                         action = layout.hit(p).map(|h| (i, layout.items[h].1.clone()));
-                    } else {
+                    } else if !*through {
                         v.popup = false;
                         v.held = true;
                         v.press = 1.0;
@@ -552,6 +671,7 @@ impl PointerHandler for App {
             }
         }
         if tapped {
+            (self.shift_down, self.last_shift_tap) = (None, None);
             self.tap_sound();
         }
         if let Some((i, action)) = action {
@@ -634,12 +754,38 @@ fn run(initial: Option<Cmd>) -> Result<(), String> {
     })
     .map_err(|e| format!("control socket: {e}"))?;
 
+    // Ctrl-C or a plain kill must still put the cursor theme back.
+    let signal_tx = std::sync::Mutex::new(tx.clone());
+    let _ = ctrlc::set_handler(move || {
+        if let Ok(tx) = signal_tx.lock() {
+            let _ = tx.send(Cmd::Quit);
+        }
+    });
+
     let settings = Settings::load();
     let icon = lib
         .icon(64)
         .map(|(size, data)| vec![ksni::Icon { width: size as i32, height: size as i32, data }])
         .unwrap_or_default();
-    let tray = tray::spawn(tray::HandTray { tx: tx.clone(), active: false, sound_on: settings.sound_on, icon });
+    let tray = tray::spawn(tray::HandTray { tx: tx.clone(), active: false, sound_on: settings.sound_on, through: false, icon });
+
+    let (cursor_tx, cursor_rx) = channel::channel::<(f32, f32)>();
+    event_loop
+        .handle()
+        .insert_source(cursor_rx, |event, _, app| {
+            if let channel::Event::Msg((x, y)) = event {
+                app.cursor_moved(x, y);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let cursor_tx = std::sync::Mutex::new(cursor_tx);
+    let tracker = cursor::Tracker::new(move |x, y| {
+        if let Ok(tx) = cursor_tx.lock() {
+            let _ = tx.send((x, y));
+        }
+    })
+    .map_err(|e| eprintln!("tinyhand: no session bus ({e}); click-through won't show the hand"))
+    .ok();
 
     let mut pinned: Vec<String> = render::DEFAULT_PINNED.iter().map(|s| s.to_string()).collect();
     let mut app = App {
@@ -660,6 +806,11 @@ fn run(initial: Option<Cmd>) -> Result<(), String> {
         settings,
         pinned: Vec::new(),
         tray,
+        through: false,
+        tracker,
+        arrow: arrow::ArrowHider::new(),
+        shift_down: None,
+        last_shift_tap: None,
         exit: false,
     };
     if !pinned.contains(&app.settings.style) {
@@ -681,6 +832,8 @@ fn run(initial: Option<Cmd>) -> Result<(), String> {
         event_loop.dispatch(None, &mut app).map_err(|e| e.to_string())?;
         let _ = app.conn.flush();
     }
+    app.tracker = None; // unloads the KWin script
+    app.arrow.set(false);
     ipc::cleanup();
     Ok(())
 }
@@ -689,7 +842,7 @@ fn run(initial: Option<Cmd>) -> Result<(), String> {
 fn render_test(out: &str, style: &str) -> Result<(), String> {
     let mut lib = Library::open(assets_dir()?)?;
     lib.load_thumbs();
-    let settings = Settings { style: style.to_string(), sound_on: true, size: 0.13, shadow: true, fade_seconds: 3.0 };
+    let settings = Settings { style: style.to_string(), sound_on: true, size: 0.13, shadow: true, fade_seconds: 3.0, hide_arrow: true };
     let pinned: Vec<String> = render::DEFAULT_PINNED.iter().map(|s| s.to_string()).collect();
     let (w, h) = (1920u32, 1080u32);
     let mut pix = tiny_skia::Pixmap::new(w, h).ok_or("pixmap")?;
@@ -716,6 +869,8 @@ usage: tinyhand [command]
   clear                  clear the drawing
   style <id>             switch to a hand (or `laser`) and turn the pointer on
   sound on|off|toggle    tap sound
+  clickthrough on|off|toggle
+                         let clicks reach the apps underneath; the hand stays
   status                 print the state file
   quit                   stop TinyHand
 

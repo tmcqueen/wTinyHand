@@ -440,6 +440,7 @@ impl Stroke {
 pub enum Action {
     Style(String),
     More,
+    Through,
     Sound,
     Exit,
 }
@@ -471,14 +472,14 @@ impl Layout {
     pub fn new(w: f32, h: f32, k: f32, pinned: &[String], popup: bool) -> Layout {
         let (btn, gap, pad, sep) = (44.0 * k, 4.0 * k, 8.0 * k, 10.0 * k);
         let mut actions: Vec<Action> = pinned.iter().map(|s| Action::Style(s.clone())).collect();
-        actions.extend([Action::More, Action::Sound, Action::Exit]);
+        actions.extend([Action::More, Action::Through, Action::Sound, Action::Exit]);
         let n = actions.len() as f32;
         let bar_w = 2.0 * pad + n * btn + (n - 1.0) * gap + sep;
         let bar = Rect { x: ((w - bar_w) / 2.0).round(), y: (h - btn - 2.0 * pad - 28.0 * k).round(), w: bar_w, h: btn + 2.0 * pad };
         let mut items = Vec::new();
         let mut x = bar.x + pad;
         for a in actions {
-            if a == Action::Sound {
+            if a == Action::Through {
                 x += sep;
             }
             items.push((Rect { x, y: bar.y + pad, w: btn, h: btn }, a));
@@ -542,6 +543,7 @@ fn line(pm: &mut PixmapMut, path: Option<Path>, hex: u32, width: f32) {
 pub struct ToolbarState<'a> {
     pub style: &'a str,
     pub sound_on: bool,
+    pub through: bool,
     pub popup: bool,
     pub hover: Option<usize>,
 }
@@ -557,6 +559,7 @@ pub fn draw_toolbar(pm: &mut PixmapMut, lib: &Library, layout: &Layout, st: &Too
         let selected = match action {
             Action::Style(id) => id == st.style,
             Action::More => st.popup,
+            Action::Through => st.through,
             _ => false,
         };
         if selected {
@@ -586,6 +589,21 @@ pub fn draw_toolbar(pm: &mut PixmapMut, lib: &Library, layout: &Layout, st: &Too
                     let (x, y) = at(dx, 0.0);
                     fill(pm, PathBuilder::from_circle(x, y, 2.4 * k), FG, 1.0);
                 }
+            }
+            Action::Through => {
+                // An ordinary arrow cursor: clicks go to the apps underneath.
+                let shape = [(-6.0, -9.5), (-6.0, 7.0), (-2.2, 3.6), (0.8, 9.8), (3.4, 8.6), (0.5, 2.6), (5.8, 2.6)];
+                let mut pb = PathBuilder::new();
+                for (i, (dx, dy)) in shape.iter().enumerate() {
+                    let (x, y) = at(*dx, *dy);
+                    if i == 0 {
+                        pb.move_to(x, y)
+                    } else {
+                        pb.line_to(x, y)
+                    }
+                }
+                pb.close();
+                fill(pm, pb.finish(), FG, 1.0);
             }
             Action::Sound => {
                 let mut pb = PathBuilder::new();

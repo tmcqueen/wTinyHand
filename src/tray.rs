@@ -8,6 +8,7 @@ pub struct HandTray {
     pub tx: Sender<Cmd>,
     pub active: bool,
     pub sound_on: bool,
+    pub through: bool,
     pub icon: Vec<ksni::Icon>,
 }
 
@@ -37,6 +38,13 @@ impl ksni::Tray for HandTray {
                 label: "Pointer".into(),
                 checked: self.active,
                 activate: Box::new(|t: &mut Self| t.send(Cmd::Toggle)),
+                ..Default::default()
+            }
+            .into(),
+            CheckmarkItem {
+                label: "Click-through".into(),
+                checked: self.through,
+                activate: Box::new(|t: &mut Self| t.send(Cmd::Through(None))),
                 ..Default::default()
             }
             .into(),
